@@ -1,0 +1,47 @@
+# Build outputs
+build/
+build-*/
+out/
+install/
+_install/
+cmake-build-*/
+
+# IDE / editor
+.vs/
+.vscode/
+.idea/
+*.user
+*.suo
+*.VC.db
+*.VC.opendb
+CMakeUserPresets.json
+
+# Compiled artifacts
+*.obj
+*.o
+*.exe
+*.dll
+*.lib
+*.exp
+*.pdb
+*.ilk
+*.so
+*.dylib
+*.a
+
+# Runtime debris
+*.log
+*.tmp
+*.dmp
+crash-*
+_scratch/
+_work/
+.local/
+run/
+state/
+*.fcfsnap
+*.fcfjournal
+*.fcfstate
+
+# Fresh-clone closure workspace
+_closure/
