@@ -304,7 +304,7 @@ compute capability 12.0, CUDA 12.9, driver 616.92).
   CP/ECC fault handling, RDMA device isolation, DPU/SmartNIC containment, physical rack or power
   fault injection.
 
-`fcf-cli --connect <host:port> capabilities`, `fcf-coordinator --capabilities` and the runtime's own `capability report print these labels.
+`fcf-cli --connect <host:port> capabilities`, `fcf-coordinator --capabilities` and the runtime's own `capability report` print these labels.
 
 **A SYNTHETIC capability is never silently upgraded to REAL.**
 
