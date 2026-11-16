@@ -359,35 +359,11 @@ bool read_topology(ByteReader& reader, Topology& topology) {
     if (!reader.ok()) {
         return false;
     }
-    // Durable topology must be completely resolvable: a persisted domain or
-    // dependency that references a missing resource is corruption, not a
-    // forward declaration.
-    auto member_ok = [&topology](const IdSet<ResourceId>& members) {
-        for (const ResourceId member : members) {
-            if (topology.resources.find(member) == topology.resources.end()) {
-                return false;
-            }
-        }
-        return true;
-    };
-    for (const auto& entry : topology.containment_domains) {
-        if (!member_ok(entry.second.members)) {
-            reader.reject();
-            return false;
-        }
-    }
-    for (const auto& entry : topology.isolation_domains) {
-        if (!member_ok(entry.second.members)) {
-            reader.reject();
-            return false;
-        }
-    }
-    for (const auto& entry : topology.failure_domains) {
-        if (!member_ok(entry.second.members)) {
-            reader.reject();
-            return false;
-        }
-    }
+    // A boundary may be declared before the resources that will live inside it,
+    // so a domain member without a resource is a state the runtime produces and
+    // must be able to read back; it is reported as unresolved, never as corruption.
+    // A dependency always joins two registered resources, and a resource always
+    // names boundaries that exist: those references must resolve.
     for (const auto& entry : topology.dependencies.edges) {
         if (topology.resources.find(entry.second.source) == topology.resources.end() ||
             topology.resources.find(entry.second.destination) == topology.resources.end()) {

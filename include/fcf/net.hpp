@@ -9,6 +9,7 @@
 #ifndef FCF_NET_HPP
 #define FCF_NET_HPP
 
+#include <atomic>
 #include <cstdint>
 #include <memory>
 #include <span>
@@ -49,7 +50,15 @@ public:
 
     /// Closes the send side so the peer observes end-of-stream.
     void shutdown_send();
-    /// Closes the connection. Idempotent and safe to call from another thread.
+    /// Ends the conversation from another thread without closing the socket. The
+    /// send side is closed after everything already written, so the peer still
+    /// reads it and then sees end-of-stream; a receive in progress on the owning
+    /// thread, or issued later, fails. The owning thread then closes the socket.
+    void interrupt();
+    /// Closes the connection. Idempotent and safe to call from another thread, but
+    /// closing a socket while its owning thread is blocked in a receive resets the
+    /// connection and the peer loses what it has not read yet: use interrupt() to
+    /// end a connection another thread is serving.
     void close();
 
     [[nodiscard]] bool valid() const noexcept { return handle_ != kInvalidHandle; }
@@ -58,7 +67,10 @@ public:
 private:
     friend class Listener;
     static constexpr std::uintptr_t kInvalidHandle = static_cast<std::uintptr_t>(~0ULL);
-    std::uintptr_t handle_ = kInvalidHandle;
+    /// Atomic because close() may run on another thread while the owning thread
+    /// is inside send_frame() or receive_frame().
+    std::atomic<std::uintptr_t> handle_{kInvalidHandle};
+    /// Reassembly buffer. Touched only by the thread that receives.
     std::vector<std::byte> residual_;
     std::string peer_;
 };

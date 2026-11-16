@@ -294,6 +294,38 @@ struct FileHandle {
 
 #endif
 
+/// Walks the journal frames and returns the offset at which the readable records
+/// end. `torn` is set when the bytes after that offset are an unfinished final
+/// record, which is what a crash in the middle of an append leaves behind. Any
+/// other unreadable content is corruption: it is left exactly where it is, for
+/// recovery to report.
+[[nodiscard]] std::size_t readable_journal_end(const std::vector<std::byte>& journal, bool& torn) {
+    torn = false;
+    std::size_t offset = 0;
+    while (offset < journal.size()) {
+        const std::size_t remaining = journal.size() - offset;
+        if (remaining < kJournalHeaderBytes) {
+            torn = true;
+            break;
+        }
+        const auto* header = reinterpret_cast<const std::uint8_t*>(journal.data() + offset);
+        if (get_u32(header) != kJournalRecordMagic) {
+            break;
+        }
+        const std::uint32_t record_len = get_u32(header + 4);
+        if (record_len > kMaxJournalRecordBytes) {
+            break;
+        }
+        const std::size_t total = kJournalHeaderBytes + static_cast<std::size_t>(record_len);
+        if (remaining < total) {
+            torn = true;
+            break;
+        }
+        offset += total;
+    }
+    return offset;
+}
+
 }  // namespace
 
 std::string_view snapshot_magic() noexcept { return std::string_view(kSnapshotMagic, 8); }
@@ -396,6 +428,16 @@ Status DurableStore::append_record(std::uint64_t sequence, std::span<const std::
     put_u32(bytes + 8, crc);
 
     const std::lock_guard<std::mutex> guard(mutex_);
+    if (!tail_verified_) {
+        // The first append after opening must not land behind bytes that a crash
+        // left unfinished: the next recovery would find readable records after an
+        // unreadable one and refuse the whole journal.
+        const Status discarded = discard_torn_tail_locked();
+        if (!discarded.ok()) {
+            return discarded;
+        }
+        tail_verified_ = true;
+    }
 #ifdef _WIN32
     if (journal_handle_ == nullptr) {
         return fail(ErrorCode::PERSISTENCE_IO, "persist.append", "journal is not open");
@@ -415,7 +457,6 @@ Status DurableStore::append_record(std::uint64_t sequence, std::span<const std::
         return fail(ErrorCode::PERSISTENCE_IO, "persist.append", "journal flush failed",
                     "win32=" + std::to_string(GetLastError()));
     }
-    return ok_status();
 #else
     if (journal_fd_ < 0) {
         return fail(ErrorCode::PERSISTENCE_IO, "persist.append", "journal is not open");
@@ -431,8 +472,53 @@ Status DurableStore::append_record(std::uint64_t sequence, std::span<const std::
     if (flush_on_append_ && ::fsync(journal_fd_) != 0) {
         return fail(ErrorCode::PERSISTENCE_IO, "persist.append", "journal flush failed");
     }
-    return ok_status();
 #endif
+    if (sequence > highest_sequence_) {
+        highest_sequence_ = sequence;
+    }
+    return ok_status();
+}
+
+Status DurableStore::discard_torn_tail_locked() {
+    std::uint64_t end = journal_end_;
+    if (!journal_end_known_) {
+        std::vector<std::byte> journal;
+        bool exists = false;
+        const Status read = read_file(journal_path_, static_cast<std::size_t>(kMaxJournalFileBytes),
+                                      journal, exists);
+        if (!read.ok()) {
+            return read;
+        }
+        if (!exists) {
+            return ok_status();
+        }
+        bool torn = false;
+        end = readable_journal_end(journal, torn);
+        if (!torn) {
+            // Either the journal is whole, or it is corrupt and is left untouched.
+            return ok_status();
+        }
+    }
+#ifdef _WIN32
+    if (journal_handle_ == nullptr) {
+        return fail(ErrorCode::PERSISTENCE_IO, "persist.append", "journal is not open");
+    }
+    HANDLE handle = static_cast<HANDLE>(journal_handle_);
+    LARGE_INTEGER position{};
+    position.QuadPart = static_cast<LONGLONG>(end);
+    if (SetFilePointerEx(handle, position, nullptr, FILE_BEGIN) == 0 || SetEndOfFile(handle) == 0) {
+        return fail(ErrorCode::PERSISTENCE_IO, "persist.append", "cannot discard the torn journal tail",
+                    "win32=" + std::to_string(GetLastError()));
+    }
+#else
+    if (journal_fd_ < 0) {
+        return fail(ErrorCode::PERSISTENCE_IO, "persist.append", "journal is not open");
+    }
+    if (::ftruncate(journal_fd_, static_cast<off_t>(end)) != 0) {
+        return fail(ErrorCode::PERSISTENCE_IO, "persist.append", "cannot discard the torn journal tail");
+    }
+#endif
+    return ok_status();
 }
 
 Status DurableStore::save_snapshot(std::span<const std::byte> payload, std::uint64_t sequence) {
@@ -460,22 +546,27 @@ Status DurableStore::save_snapshot(std::span<const std::byte> payload, std::uint
     const std::lock_guard<std::mutex> guard(mutex_);
 #ifdef _WIN32
     const std::string temp_path = snapshot_path_ + ".tmp." + std::to_string(GetCurrentProcessId());
-    const Status written = write_file_atomic(snapshot_path_, temp_path,
-                                             std::span<const std::byte>(image.data(), image.size()));
-    if (!written.ok()) {
-        return written;
-    }
-    return truncate_journal_locked();
 #else
-    (void)sequence;
     const std::string temp_path = snapshot_path_ + ".tmp." + std::to_string(::getpid());
+#endif
     const Status written = write_file_atomic(snapshot_path_, temp_path,
                                              std::span<const std::byte>(image.data(), image.size()));
     if (!written.ok()) {
         return written;
     }
-    return truncate_journal_locked();
-#endif
+    if (highest_sequence_ > sequence) {
+        // A mutation committed while the snapshot was being written. Its record is
+        // not covered by the snapshot, so the journal is kept as it is: recovery
+        // skips the records the snapshot already holds, and a later snapshot that
+        // covers everything truncates.
+        return ok_status();
+    }
+    const Status truncated = truncate_journal_locked();
+    if (truncated.ok()) {
+        journal_end_known_ = true;
+        journal_end_ = 0;
+    }
+    return truncated;
 }
 
 Status DurableStore::truncate_journal_locked() {
@@ -585,6 +676,9 @@ Result<DurableStore::Recovery> DurableStore::recover() const {
             const std::size_t remaining = journal_bytes.size() - offset;
             if (remaining < kJournalHeaderBytes) {
                 recovery.torn_tail_bytes = remaining;
+                journal_end_known_ = true;
+                journal_end_ = offset;
+                tail_verified_ = false;
                 break;
             }
             const auto* header = reinterpret_cast<const std::uint8_t*>(journal_bytes.data() + offset);
@@ -602,6 +696,9 @@ Result<DurableStore::Recovery> DurableStore::recover() const {
             const std::size_t total = kJournalHeaderBytes + static_cast<std::size_t>(record_len);
             if (remaining < total) {
                 recovery.torn_tail_bytes = remaining;
+                journal_end_known_ = true;
+                journal_end_ = offset;
+                tail_verified_ = false;
                 break;
             }
             const auto payload = std::span<const std::byte>(journal_bytes.data() + offset + kJournalHeaderBytes,
@@ -616,6 +713,9 @@ Result<DurableStore::Recovery> DurableStore::recover() const {
                                   "offset=" + std::to_string(offset));
             }
             const std::uint64_t sequence = get_u64(reinterpret_cast<const std::uint8_t*>(payload.data()));
+            if (sequence > highest_sequence_) {
+                highest_sequence_ = sequence;
+            }
             if (sequence <= recovery.snapshot_sequence) {
                 ++recovery.journal_records_skipped;
             } else {

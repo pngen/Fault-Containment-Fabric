@@ -368,4 +368,74 @@ FCF_TEST(containment_lifecycle, explain_is_stable_and_covers_every_bucket) {
     FCF_REQUIRE(text.find("VERIFICATION:") != std::string::npos);
 }
 
+FCF_TEST(containment_lifecycle, resource_update_does_not_lift_containment) {
+    Fixture fixture;
+    const FaultId fault = fixture.raise();
+    const ContainmentGeneration generation = fixture.contain(fault);
+    const Result<ResourceStatusView> contained =
+        fixture.engine.query_resource_status(ResourceId::from_value(2));
+    FCF_REQUIRE(contained.ok());
+    FCF_REQUIRE(contained.value().quarantined);
+
+    // A topology update that describes the resource as healthy is not a release.
+    ResourceRecord record = contained.value().resource;
+    record.name = "exec-A-renamed";
+    record.state = ResourceOperationalState::ACTIVE;
+    record.quarantined = false;
+    record.mechanism = ContainmentMechanism::NONE;
+    record.containment_generation = ContainmentGeneration{};
+    const Result<ResourceRecord> updated = fixture.engine.update_resource(record, record.generation);
+    FCF_REQUIRE_MSG(updated.ok(), updated.ok() ? "" : updated.error().to_string());
+
+    const Result<ResourceStatusView> after =
+        fixture.engine.query_resource_status(ResourceId::from_value(2));
+    FCF_REQUIRE(after.ok());
+    FCF_EQ(after.value().resource.name, std::string("exec-A-renamed"));
+    FCF_REQUIRE_MSG(after.value().quarantined, "an update released a contained resource");
+    FCF_REQUIRE(!after.value().operable);
+    FCF_EQ(after.value().resource.state, contained.value().resource.state);
+    FCF_EQ(after.value().resource.containment_generation, generation);
+}
+
+FCF_TEST(containment_lifecycle, release_request_from_a_superseded_epoch_is_refused) {
+    Fixture fixture;
+    const FaultId fault = fixture.raise();
+    const ContainmentGeneration generation = fixture.contain(fault);
+    RecordingExecutor executor;
+    FCF_REQUIRE(fixture.engine.dispatch_containment(generation, &executor).ok());
+    fixture.settle(generation);
+    FCF_REQUIRE(fixture.engine.verify_containment(generation).ok());
+
+    const CoordinatorEpoch superseded = fixture.engine.epoch();
+    FCF_REQUIRE(fixture.engine.begin_epoch(5000, "coordinator restart").ok());
+    const Result<ResourceRecord> fresh = fixture.engine.publish_resource_evidence(
+        ResourceId::from_value(1), ResourceGeneration{}, EvidenceFreshness::FRESH,
+        EvidenceSequence::from_value(70), ContainmentMechanism::NONE, "test");
+    FCF_REQUIRE(fresh.ok());
+
+    ReleaseRequest request;
+    request.resource = ResourceId::from_value(1);
+    request.containment_generation = generation;
+    request.authority = "operator:ticket-9";
+    request.expected_generation = fresh.value().generation;
+    request.evidence_sequence = fresh.value().evidence_sequence;
+
+    // A request issued under the previous coordinator epoch carries no authority now.
+    request.epoch = superseded;
+    const Result<ReleaseAssessment> stale = fixture.engine.authorize_release(request);
+    FCF_REQUIRE(stale.ok());
+    FCF_REQUIRE_MSG(!stale.value().granted, "a release request from a superseded epoch was granted");
+    FCF_EQ(stale.value().decision, ReleaseDecision::RELEASE_DENIED_AUTHORITY);
+    const Result<ResourceStatusView> held =
+        fixture.engine.query_resource_status(ResourceId::from_value(1));
+    FCF_REQUIRE(held.ok());
+    FCF_REQUIRE(held.value().quarantined);
+
+    // The same request under the current epoch is judged on its merits.
+    request.epoch = fixture.engine.epoch();
+    const Result<ReleaseAssessment> current = fixture.engine.authorize_release(request);
+    FCF_REQUIRE(current.ok());
+    FCF_REQUIRE(current.value().granted);
+}
+
 int main(int argc, char** argv) { return fcf::test::run(argc, argv); }

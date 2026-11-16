@@ -59,7 +59,8 @@ public:
 
     /// Serializes the supplied payload to a temporary file, flushes it, then
     /// atomically replaces the authoritative snapshot. Only then is the journal
-    /// truncated to the last sequence covered by the snapshot.
+    /// truncated to the last sequence covered by the snapshot: a record newer
+    /// than the snapshot is never discarded.
     Status save_snapshot(std::span<const std::byte> payload, std::uint64_t sequence);
 
     /// Reads and integrity-checks the durable state. Corruption is reported, never
@@ -75,6 +76,7 @@ private:
 
     Status open_files(bool for_append);
     Status truncate_journal_locked();
+    Status discard_torn_tail_locked();
 
     std::string directory_;
     std::string snapshot_path_;
@@ -82,6 +84,14 @@ private:
     void* journal_handle_ = nullptr;  // HANDLE on Windows
     int journal_fd_ = -1;             // file descriptor on POSIX
     bool flush_on_append_ = true;
+    /// Highest sequence this store has appended or read back.
+    mutable std::uint64_t highest_sequence_ = 0;
+    /// Where the readable journal ends, once that is known.
+    mutable bool journal_end_known_ = false;
+    mutable std::uint64_t journal_end_ = 0;
+    /// False until an append has made sure it does not land behind bytes a crash
+    /// left unfinished.
+    mutable bool tail_verified_ = false;
     mutable std::mutex mutex_;
 };
 

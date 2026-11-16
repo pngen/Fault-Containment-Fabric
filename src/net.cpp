@@ -97,17 +97,16 @@ void shutdown_network() {
 Socket::~Socket() { close(); }
 
 Socket::Socket(Socket&& other) noexcept
-    : handle_(other.handle_), residual_(std::move(other.residual_)), peer_(std::move(other.peer_)) {
-    other.handle_ = kInvalidHandle;
-}
+    : handle_(other.handle_.exchange(kInvalidHandle)),
+      residual_(std::move(other.residual_)),
+      peer_(std::move(other.peer_)) {}
 
 Socket& Socket::operator=(Socket&& other) noexcept {
     if (this != &other) {
         close();
-        handle_ = other.handle_;
+        handle_ = other.handle_.exchange(kInvalidHandle);
         residual_ = std::move(other.residual_);
         peer_ = std::move(other.peer_);
-        other.handle_ = kInvalidHandle;
     }
     return *this;
 }
@@ -165,10 +164,11 @@ Status Socket::send_frame(MessageKind kind, std::span<const std::byte> payload) 
         return encoded.error();
     }
     const std::vector<std::byte>& bytes = encoded.value();
-    if (handle_ == kInvalidHandle) {
+    const std::uintptr_t handle = handle_.load();
+    if (handle == kInvalidHandle) {
         return fail(ErrorCode::EXECUTOR_UNAVAILABLE, "net.send", "socket is closed");
     }
-    const NativeSocket native = static_cast<NativeSocket>(handle_);
+    const NativeSocket native = static_cast<NativeSocket>(handle);
     std::size_t offset = 0;
     while (offset < bytes.size()) {
         const int chunk = static_cast<int>(
@@ -183,10 +183,11 @@ Status Socket::send_frame(MessageKind kind, std::span<const std::byte> payload) 
 }
 
 Result<Frame> Socket::receive_frame() {
-    if (handle_ == kInvalidHandle) {
+    const std::uintptr_t handle = handle_.load();
+    if (handle == kInvalidHandle) {
         return make_error(ErrorCode::EXECUTOR_UNAVAILABLE, "net.receive", "socket is closed");
     }
-    const NativeSocket native = static_cast<NativeSocket>(handle_);
+    const NativeSocket native = static_cast<NativeSocket>(handle);
     std::vector<std::byte> chunk(64U * 1024U);
     for (;;) {
         const FrameDecodeResult decoded =
@@ -206,7 +207,7 @@ Result<Frame> Socket::receive_frame() {
                               "peer closed the connection");
         }
         if (got < 0) {
-            return make_error(ErrorCode::EXECUTOR_UNAVAILABLE, "net.receive", "receive failed");
+            return socket_error(ErrorCode::EXECUTOR_UNAVAILABLE, "net.receive", "receive failed");
         }
         if (residual_.size() + static_cast<std::size_t>(got) > kMaxConnectionBufferBytes) {
             return make_error(ErrorCode::RESOURCE_EXHAUSTED, "net.receive",
@@ -217,24 +218,42 @@ Result<Frame> Socket::receive_frame() {
 }
 
 void Socket::shutdown_send() {
-    if (handle_ == kInvalidHandle) {
+    const std::uintptr_t handle = handle_.load();
+    if (handle == kInvalidHandle) {
         return;
     }
 #ifdef _WIN32
-    ::shutdown(static_cast<NativeSocket>(handle_), SD_SEND);
+    ::shutdown(static_cast<NativeSocket>(handle), SD_SEND);
 #else
-    ::shutdown(static_cast<NativeSocket>(handle_), SHUT_WR);
+    ::shutdown(static_cast<NativeSocket>(handle), SHUT_WR);
+#endif
+}
+
+void Socket::interrupt() {
+    const std::uintptr_t handle = handle_.load();
+    if (handle == kInvalidHandle) {
+        return;
+    }
+    const NativeSocket native = static_cast<NativeSocket>(handle);
+#ifdef _WIN32
+    // Both directions: what was already written is delivered and followed by an
+    // orderly end of stream, and a receive issued from now on fails at once. A
+    // receive that is already pending is not woken by that, so it is cancelled.
+    ::shutdown(native, SD_BOTH);
+    ::CancelIoEx(reinterpret_cast<HANDLE>(native), nullptr);
+#else
+    ::shutdown(native, SHUT_RDWR);
 #endif
 }
 
 void Socket::close() {
-    if (handle_ != kInvalidHandle) {
-        const NativeSocket native = static_cast<NativeSocket>(handle_);
-        handle_ = kInvalidHandle;
-        close_native(native);
+    // Exactly one caller closes the native socket, and nothing else is touched:
+    // the reassembly buffer belongs to the thread that may still be receiving.
+    const std::uintptr_t handle = handle_.exchange(kInvalidHandle);
+    if (handle != kInvalidHandle) {
+        close_native(static_cast<NativeSocket>(handle));
         shutdown_network();
     }
-    residual_.clear();
 }
 
 std::string Socket::peer() const { return peer_; }

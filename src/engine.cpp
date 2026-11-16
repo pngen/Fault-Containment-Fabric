@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <condition_variable>
 #include <deque>
 #include <mutex>
 #include <string>
@@ -76,6 +77,70 @@ bool read_counters(detail::ByteReader& reader, Counters& counters) {
     counters.next_action_id = reader.u64();
     counters.next_degraded_id = reader.u64();
     return reader.ok();
+}
+
+// --- Replay of membership -------------------------------------------------------------
+//
+// A mutation journals the record it was asked to change, not every record it
+// touched: a resource that registers joins the boundaries it references, and a
+// boundary that is declared, updated or removed stamps or clears the placement of
+// its members. Replay reproduces exactly those effects, so the recovered topology
+// is the topology that was acknowledged.
+
+template <class DomainMap, class Id>
+void rejoin_domain(DomainMap& domains, Id previous, Id current, ResourceId resource) {
+    if (previous.valid() && previous != current) {
+        const auto left = domains.find(previous);
+        if (left != domains.end()) {
+            id_set_erase(left->second.members, resource);
+        }
+    }
+    if (current.valid()) {
+        const auto joined = domains.find(current);
+        if (joined != domains.end()) {
+            id_set_insert(joined->second.members, resource);
+        }
+    }
+}
+
+template <class DomainMap, class Domain, class Id>
+void replay_domain_upsert(Topology& topology, DomainMap& domains, const Domain& domain,
+                          Id ResourceRecord::*placement) {
+    const auto previous = domains.find(domain.id);
+    if (previous != domains.end()) {
+        for (const ResourceId member : previous->second.members) {
+            if (id_set_contains(domain.members, member)) {
+                continue;
+            }
+            const auto record = topology.resources.find(member);
+            if (record != topology.resources.end() && record->second.*placement == domain.id) {
+                record->second.*placement = Id{};
+            }
+        }
+    }
+    for (const ResourceId member : domain.members) {
+        const auto record = topology.resources.find(member);
+        if (record != topology.resources.end()) {
+            record->second.*placement = domain.id;
+        }
+    }
+    domains[domain.id] = domain;
+}
+
+template <class DomainMap, class Id>
+void replay_domain_remove(Topology& topology, DomainMap& domains, Id id,
+                          Id ResourceRecord::*placement) {
+    const auto existing = domains.find(id);
+    if (existing == domains.end()) {
+        return;
+    }
+    for (const ResourceId member : existing->second.members) {
+        const auto record = topology.resources.find(member);
+        if (record != topology.resources.end() && record->second.*placement == id) {
+            record->second.*placement = Id{};
+        }
+    }
+    domains.erase(existing);
 }
 
 [[nodiscard]] ContainmentMechanism default_mechanism_for(const ResourceRecord& record) noexcept {
@@ -216,22 +281,86 @@ struct Engine::Impl {
               [this](detail::ByteWriter& writer) { write_counters(writer, counters()); });
     }
 
-    /// Appends and flushes staged records. Never called while holding the state lock.
+    // Records must reach the journal in the order their sequence numbers were
+    // assigned. A crash can cut the journal at any byte, and a later record that
+    // is durable while an earlier one is not is a sequence gap that recovery
+    // refuses to replay. Sequences are assigned under the state lock; the journal
+    // turn is taken afterwards, without it, so readers never wait for persistence.
+    std::mutex journal_mutex;
+    std::condition_variable journal_turn;
+    /// Highest sequence that has had its turn at the journal.
+    std::uint64_t journal_appended = 0;
+    /// True while one batch is being appended. The turn is held by this flag, not
+    /// by the mutex, so no internal lock is held across persistence I/O.
+    bool journal_busy = false;
+
+    /// Appends and flushes staged records in sequence order, then empties the
+    /// batch. Never called while holding the state lock.
     Status flush(std::vector<PendingWrite>& pending) {
-        if (store == nullptr) {
+        if (pending.empty()) {
             return ok_status();
         }
-        for (const PendingWrite& write : pending) {
-            const Status status = store->append_record(write.sequence, write.bytes);
-            if (!status.ok()) {
-                std::unique_lock<std::shared_mutex> lock(mutex);
-                durability_healthy = false;
-                add_history(HistoryEventType::PERSISTENCE_FAULT, status.error().to_string(), {});
-                return status;
+        DurableStore* target = nullptr;
+        {
+            std::shared_lock<std::shared_mutex> lock(mutex);
+            target = store;
+        }
+        {
+            std::unique_lock<std::mutex> turn(journal_mutex);
+            const std::uint64_t first = pending.front().sequence;
+            journal_turn.wait(turn, [this, first]() {
+                return !journal_busy && journal_appended + 1U >= first;
+            });
+            journal_busy = true;
+        }
+        Status result = ok_status();
+        if (target != nullptr) {
+            for (const PendingWrite& write : pending) {
+                const Status status = target->append_record(write.sequence, write.bytes);
+                if (!status.ok()) {
+                    result = status;
+                    break;
+                }
             }
         }
-        return ok_status();
+        {
+            const std::lock_guard<std::mutex> turn(journal_mutex);
+            if (journal_appended < pending.back().sequence) {
+                journal_appended = pending.back().sequence;
+            }
+            journal_busy = false;
+        }
+        journal_turn.notify_all();
+        pending.clear();
+        if (!result.ok()) {
+            std::unique_lock<std::shared_mutex> lock(mutex);
+            durability_healthy = false;
+            add_history(HistoryEventType::PERSISTENCE_FAULT, result.error().to_string(), {});
+        }
+        return result;
     }
+
+    /// The journal records staged by one mutation. A sequence number is consumed
+    /// the moment a record is staged, so a staged batch must reach the journal
+    /// even when the mutation goes on to report an error: a dropped record is a
+    /// sequence gap, and it would also hold back every later record. A batch that
+    /// goes out of scope with records still pending therefore flushes itself. It
+    /// is always declared before the state lock, so that happens with the lock
+    /// already released.
+    class Batch : public std::vector<PendingWrite> {
+    public:
+        explicit Batch(Impl& owner) : owner_(owner) {}
+        Batch(const Batch&) = delete;
+        Batch& operator=(const Batch&) = delete;
+        ~Batch() {
+            if (!empty()) {
+                (void)owner_.flush(*this);
+            }
+        }
+
+    private:
+        Impl& owner_;
+    };
 
     void rebuild_digest_index() {
         digest_by_fault.clear();
@@ -331,7 +460,7 @@ Status Engine::attach_store(DurableStore* store) {
 }
 
 Result<CoordinatorEpoch> Engine::begin_epoch(std::uint64_t now_ms, std::string reason) {
-    std::vector<PendingWrite> pending;
+    Impl::Batch pending(*impl_);
     {
         std::unique_lock<std::shared_mutex> lock(impl_->mutex);
         impl_->state.epoch = next_generation(impl_->state.epoch);
@@ -379,7 +508,7 @@ Result<ContainmentDomain> Engine::register_domain(ContainmentDomain domain) {
     if (!domain.id.valid()) {
         return make_error(ErrorCode::INVALID_ID, "domain.register", "domain identity is invalid");
     }
-    std::vector<PendingWrite> pending;
+    Impl::Batch pending(*impl_);
     std::unique_lock<std::shared_mutex> lock(impl_->mutex);
     // A boundary may be declared before the resources that will live inside it.
     // Membership is reconciled when those resources register, and any member that
@@ -389,8 +518,8 @@ Result<ContainmentDomain> Engine::register_domain(ContainmentDomain domain) {
         return make_error(ErrorCode::DUPLICATE_ID, "domain.register", "containment domain already exists",
                           to_string(domain.id));
     }
-    domain.generation = next_generation(impl_->state.topology_generation);
-    impl_->state.topology_generation = domain.generation;
+    // Every member is checked before anything changes: a refused registration
+    // must leave no resource placed in a boundary that does not exist.
     for (const ResourceId member : domain.members) {
         const auto record_it = impl_->state.topology.resources.find(member);
         if (record_it == impl_->state.topology.resources.end()) {
@@ -402,7 +531,14 @@ Result<ContainmentDomain> Engine::register_domain(ContainmentDomain domain) {
                               "resource already belongs to another containment domain",
                               to_string(member));
         }
-        record_it->second.containment_domain = domain.id;
+    }
+    domain.generation = next_generation(impl_->state.topology_generation);
+    impl_->state.topology_generation = domain.generation;
+    for (const ResourceId member : domain.members) {
+        const auto record_it = impl_->state.topology.resources.find(member);
+        if (record_it != impl_->state.topology.resources.end()) {
+            record_it->second.containment_domain = domain.id;
+        }
     }
     const ContainmentDomain stored = domain;
     impl_->state.topology.containment_domains.emplace(stored.id, stored);
@@ -431,7 +567,7 @@ Result<ContainmentDomain> Engine::register_domain(ContainmentDomain domain) {
 }
 
 Status Engine::update_domain(ContainmentDomain domain, TopologyGeneration expected) {
-    std::vector<PendingWrite> pending;
+    Impl::Batch pending(*impl_);
     std::unique_lock<std::shared_mutex> lock(impl_->mutex);
     const auto it = impl_->state.topology.containment_domains.find(domain.id);
     if (it == impl_->state.topology.containment_domains.end()) {
@@ -457,9 +593,11 @@ Status Engine::update_domain(ContainmentDomain domain, TopologyGeneration expect
     }
     for (const ResourceId member : previous_members) {
         if (!id_set_contains(domain.members, member)) {
-            ResourceRecord& record = impl_->state.topology.resources[member];
-            if (record.containment_domain == domain.id) {
-                record.containment_domain = ContainmentDomainId{};
+            // A previous member may be a forward declaration that never registered.
+            const auto record = impl_->state.topology.resources.find(member);
+            if (record != impl_->state.topology.resources.end() &&
+                record->second.containment_domain == domain.id) {
+                record->second.containment_domain = ContainmentDomainId{};
             }
         }
     }
@@ -476,7 +614,7 @@ Status Engine::update_domain(ContainmentDomain domain, TopologyGeneration expect
 }
 
 Status Engine::remove_domain(ContainmentDomainId id, TopologyGeneration expected) {
-    std::vector<PendingWrite> pending;
+    Impl::Batch pending(*impl_);
     std::unique_lock<std::shared_mutex> lock(impl_->mutex);
     const auto it = impl_->state.topology.containment_domains.find(id);
     if (it == impl_->state.topology.containment_domains.end()) {
@@ -491,9 +629,11 @@ Status Engine::remove_domain(ContainmentDomainId id, TopologyGeneration expected
     impl_->state.topology.containment_domains.erase(it);
     impl_->state.topology_generation = next_generation(impl_->state.topology_generation);
     for (const ResourceId member : members) {
-        ResourceRecord& record = impl_->state.topology.resources[member];
-        if (record.containment_domain == id) {
-            record.containment_domain = ContainmentDomainId{};
+        // A member may be a forward declaration that never registered.
+        const auto record = impl_->state.topology.resources.find(member);
+        if (record != impl_->state.topology.resources.end() &&
+            record->second.containment_domain == id) {
+            record->second.containment_domain = ContainmentDomainId{};
         }
     }
     const HistoryEvent history = impl_->add_history(
@@ -510,7 +650,7 @@ Result<IsolationDomain> Engine::register_isolation_domain(IsolationDomain domain
     if (!domain.id.valid()) {
         return make_error(ErrorCode::INVALID_ID, "isolation_domain.register", "identity is invalid");
     }
-    std::vector<PendingWrite> pending;
+    Impl::Batch pending(*impl_);
     std::unique_lock<std::shared_mutex> lock(impl_->mutex);
     const auto existing = impl_->state.topology.isolation_domains.find(domain.id);
     if (existing != impl_->state.topology.isolation_domains.end()) {
@@ -543,7 +683,7 @@ Result<IsolationDomain> Engine::register_isolation_domain(IsolationDomain domain
 }
 
 Status Engine::remove_isolation_domain(IsolationDomainId id, TopologyGeneration expected) {
-    std::vector<PendingWrite> pending;
+    Impl::Batch pending(*impl_);
     std::unique_lock<std::shared_mutex> lock(impl_->mutex);
     const auto it = impl_->state.topology.isolation_domains.find(id);
     if (it == impl_->state.topology.isolation_domains.end()) {
@@ -557,9 +697,11 @@ Status Engine::remove_isolation_domain(IsolationDomainId id, TopologyGeneration 
     impl_->state.topology.isolation_domains.erase(it);
     impl_->state.topology_generation = next_generation(impl_->state.topology_generation);
     for (const ResourceId member : members) {
-        ResourceRecord& record = impl_->state.topology.resources[member];
-        if (record.isolation_domain == id) {
-            record.isolation_domain = IsolationDomainId{};
+        // A member may be a forward declaration that never registered.
+        const auto record = impl_->state.topology.resources.find(member);
+        if (record != impl_->state.topology.resources.end() &&
+            record->second.isolation_domain == id) {
+            record->second.isolation_domain = IsolationDomainId{};
         }
     }
     const HistoryEvent history = impl_->add_history(
@@ -576,7 +718,7 @@ Result<FailureDomain> Engine::register_failure_domain(FailureDomain domain) {
     if (!domain.id.valid()) {
         return make_error(ErrorCode::INVALID_ID, "failure_domain.register", "identity is invalid");
     }
-    std::vector<PendingWrite> pending;
+    Impl::Batch pending(*impl_);
     std::unique_lock<std::shared_mutex> lock(impl_->mutex);
     const auto existing = impl_->state.topology.failure_domains.find(domain.id);
     if (existing != impl_->state.topology.failure_domains.end()) {
@@ -608,7 +750,7 @@ Result<FailureDomain> Engine::register_failure_domain(FailureDomain domain) {
 }
 
 Status Engine::remove_failure_domain(FailureDomainId id, TopologyGeneration expected) {
-    std::vector<PendingWrite> pending;
+    Impl::Batch pending(*impl_);
     std::unique_lock<std::shared_mutex> lock(impl_->mutex);
     const auto it = impl_->state.topology.failure_domains.find(id);
     if (it == impl_->state.topology.failure_domains.end()) {
@@ -622,9 +764,11 @@ Status Engine::remove_failure_domain(FailureDomainId id, TopologyGeneration expe
     impl_->state.topology.failure_domains.erase(it);
     impl_->state.topology_generation = next_generation(impl_->state.topology_generation);
     for (const ResourceId member : members) {
-        ResourceRecord& record = impl_->state.topology.resources[member];
-        if (record.failure_domain == id) {
-            record.failure_domain = FailureDomainId{};
+        // A member may be a forward declaration that never registered.
+        const auto record = impl_->state.topology.resources.find(member);
+        if (record != impl_->state.topology.resources.end() &&
+            record->second.failure_domain == id) {
+            record->second.failure_domain = FailureDomainId{};
         }
     }
     const HistoryEvent history = impl_->add_history(
@@ -641,7 +785,7 @@ Result<ResourceRecord> Engine::register_resource(ResourceRecord record) {
     if (!record.id.valid()) {
         return make_error(ErrorCode::INVALID_ID, "resource.register", "resource identity is invalid");
     }
-    std::vector<PendingWrite> pending;
+    Impl::Batch pending(*impl_);
     std::unique_lock<std::shared_mutex> lock(impl_->mutex);
     if (impl_->state.topology.resources.size() >= impl_->config.max_resources) {
         return make_error(ErrorCode::RESOURCE_EXHAUSTED, "resource.register",
@@ -711,7 +855,7 @@ Result<ResourceRecord> Engine::register_resource(ResourceRecord record) {
 }
 
 Result<ResourceRecord> Engine::update_resource(ResourceRecord record, ResourceGeneration expected) {
-    std::vector<PendingWrite> pending;
+    Impl::Batch pending(*impl_);
     std::unique_lock<std::shared_mutex> lock(impl_->mutex);
     const auto it = impl_->state.topology.resources.find(record.id);
     if (it == impl_->state.topology.resources.end()) {
@@ -722,10 +866,38 @@ Result<ResourceRecord> Engine::update_resource(ResourceRecord record, ResourceGe
         return make_error(ErrorCode::STALE_RESOURCE_GENERATION, "resource.update",
                           "resource generation has advanced", to_string(it->second.generation));
     }
+    // The same graph rules as registration: a resource never references a boundary
+    // that does not exist.
+    if (record.containment_domain.valid() &&
+        impl_->state.topology.containment_domains.find(record.containment_domain) ==
+            impl_->state.topology.containment_domains.end()) {
+        return make_error(ErrorCode::INVALID_DOMAIN_GRAPH, "resource.update",
+                          "unknown containment domain", to_string(record.containment_domain));
+    }
+    if (record.isolation_domain.valid() &&
+        impl_->state.topology.isolation_domains.find(record.isolation_domain) ==
+            impl_->state.topology.isolation_domains.end()) {
+        return make_error(ErrorCode::INVALID_DOMAIN_GRAPH, "resource.update", "unknown isolation domain",
+                          to_string(record.isolation_domain));
+    }
+    if (record.failure_domain.valid() &&
+        impl_->state.topology.failure_domains.find(record.failure_domain) ==
+            impl_->state.topology.failure_domains.end()) {
+        return make_error(ErrorCode::INVALID_DOMAIN_GRAPH, "resource.update", "unknown failure domain",
+                          to_string(record.failure_domain));
+    }
     impl_->state.topology_generation = next_generation(impl_->state.topology_generation);
     record.generation = next_generation(record.generation);
     record.updated_at_ms = impl_->now();
     const ResourceRecord previous = it->second;
+    if (resource_is_contained(previous)) {
+        // An update describes a resource; it is never a release. Containment ends
+        // only through authorize_release().
+        record.state = previous.state;
+        record.quarantined = previous.quarantined;
+        record.mechanism = previous.mechanism;
+        record.containment_generation = previous.containment_generation;
+    }
     auto move_membership = [&record, &previous](auto& domains, const auto& old_id, const auto& new_id) {
         if (old_id.valid() && old_id != new_id) {
             const auto old_domain = domains.find(old_id);
@@ -763,7 +935,7 @@ Result<ResourceRecord> Engine::update_resource(ResourceRecord record, ResourceGe
 }
 
 Status Engine::remove_resource(ResourceId id, ResourceGeneration expected) {
-    std::vector<PendingWrite> pending;
+    Impl::Batch pending(*impl_);
     std::unique_lock<std::shared_mutex> lock(impl_->mutex);
     const auto it = impl_->state.topology.resources.find(id);
     if (it == impl_->state.topology.resources.end()) {
@@ -829,7 +1001,7 @@ Result<DependencyEdge> Engine::register_dependency(DependencyEdge edge) {
     if (!edge.id.valid()) {
         return make_error(ErrorCode::INVALID_ID, "dependency.register", "identity is invalid");
     }
-    std::vector<PendingWrite> pending;
+    Impl::Batch pending(*impl_);
     std::unique_lock<std::shared_mutex> lock(impl_->mutex);
     if (impl_->state.topology.dependencies.edges.size() >= impl_->config.max_dependencies) {
         return make_error(ErrorCode::RESOURCE_EXHAUSTED, "dependency.register",
@@ -874,7 +1046,7 @@ Result<DependencyEdge> Engine::register_dependency(DependencyEdge edge) {
 }
 
 Status Engine::remove_dependency(DependencyId id, DependencyGeneration expected) {
-    std::vector<PendingWrite> pending;
+    Impl::Batch pending(*impl_);
     std::unique_lock<std::shared_mutex> lock(impl_->mutex);
     const DependencyEdge* edge = impl_->state.topology.dependencies.find(id);
     if (edge == nullptr) {
@@ -902,7 +1074,7 @@ Status Engine::set_policy(ContainmentPolicy policy) {
     if (!valid.ok()) {
         return valid;
     }
-    std::vector<PendingWrite> pending;
+    Impl::Batch pending(*impl_);
     std::unique_lock<std::shared_mutex> lock(impl_->mutex);
     policy.generation = next_generation(impl_->state.policy_generation);
     impl_->state.policy_generation = policy.generation;
@@ -930,7 +1102,7 @@ Result<ResourceRecord> Engine::publish_resource_evidence(ResourceId id, Resource
                                                          EvidenceSequence sequence,
                                                          ContainmentMechanism mechanism,
                                                          std::string source) {
-    std::vector<PendingWrite> pending;
+    Impl::Batch pending(*impl_);
     std::unique_lock<std::shared_mutex> lock(impl_->mutex);
     const auto it = impl_->state.topology.resources.find(id);
     if (it == impl_->state.topology.resources.end()) {
@@ -986,7 +1158,7 @@ Result<WorkerRecord> Engine::register_worker(WorkerId worker, WorkerBootId boot,
         return make_error(ErrorCode::INVALID_ID, "worker.register",
                           "worker identity and boot identity are both required");
     }
-    std::vector<PendingWrite> pending;
+    Impl::Batch pending(*impl_);
     std::unique_lock<std::shared_mutex> lock(impl_->mutex);
     if (impl_->state.workers.incarnations.size() >= impl_->config.max_workers) {
         return make_error(ErrorCode::RESOURCE_EXHAUSTED, "worker.register", "worker ceiling reached");
@@ -1102,7 +1274,7 @@ Result<WorkerRecord> Engine::register_worker(WorkerId worker, WorkerBootId boot,
 }
 
 Status Engine::retire_worker(WorkerId worker, WorkerBootId boot, std::string reason) {
-    std::vector<PendingWrite> pending;
+    Impl::Batch pending(*impl_);
     std::unique_lock<std::shared_mutex> lock(impl_->mutex);
     const WorkerKey key{worker, boot};
     const auto it = impl_->state.workers.incarnations.find(key);
@@ -1147,7 +1319,7 @@ Result<FaultRecord> Engine::publish_fault(FaultEvidence evidence, bool* was_dupl
         return make_error(ErrorCode::INVALID_ID, "fault.publish", "fault subject is invalid");
     }
 
-    std::vector<PendingWrite> pending;
+    Impl::Batch pending(*impl_);
     std::unique_lock<std::shared_mutex> lock(impl_->mutex);
     if (impl_->state.faults.size() >= impl_->config.max_faults) {
         return make_error(ErrorCode::RESOURCE_EXHAUSTED, "fault.publish", "fault ceiling reached");
@@ -1252,7 +1424,7 @@ Result<FaultRecord> Engine::publish_fault(FaultEvidence evidence, bool* was_dupl
 }
 
 Result<FaultRecord> Engine::supersede_fault(FaultId id, FaultGeneration expected, std::string reason) {
-    std::vector<PendingWrite> pending;
+    Impl::Batch pending(*impl_);
     std::unique_lock<std::shared_mutex> lock(impl_->mutex);
     const auto it = impl_->state.faults.find(id);
     if (it == impl_->state.faults.end()) {
@@ -1513,7 +1685,7 @@ namespace {
 }  // namespace
 
 Result<ContainmentRecord> Engine::authorize_containment(FaultId id, FaultGeneration expected) {
-    std::vector<PendingWrite> pending;
+    Impl::Batch pending(*impl_);
     std::unique_lock<std::shared_mutex> lock(impl_->mutex);
     const auto fault_it = impl_->state.faults.find(id);
     if (fault_it == impl_->state.faults.end()) {
@@ -1798,7 +1970,8 @@ namespace {
     if (envelope.target_generation != resource->second.generation) {
         return ErrorCode::STALE_RESOURCE_GENERATION;
     }
-    if (envelope.worker_boot.valid() && resource->second.owner_boot != envelope.worker_boot) {
+    if (envelope.worker_boot.valid() && (resource->second.owner_boot != envelope.worker_boot ||
+                                         resource->second.owner_worker != envelope.worker)) {
         return ErrorCode::STALE_WORKER_BOOT;
     }
     const auto fault = state.faults.find(record.fault);
@@ -1829,7 +2002,7 @@ Result<DispatchSummary> Engine::dispatch_containment(ContainmentGeneration gener
                                                      Executor* executor) {
     DispatchSummary summary;
     summary.containment_generation = generation;
-    std::vector<PendingWrite> pending;
+    Impl::Batch pending(*impl_);
     std::vector<ContainmentAction> to_dispatch;
 
     {
@@ -1970,7 +2143,7 @@ Result<DispatchSummary> Engine::dispatch_containment(ContainmentGeneration gener
 }
 
 Status Engine::record_action_ack(const ActionAcknowledgment& ack) {
-    std::vector<PendingWrite> pending;
+    Impl::Batch pending(*impl_);
     std::unique_lock<std::shared_mutex> lock(impl_->mutex);
     const auto it = impl_->state.actions.find(ack.action);
     if (it == impl_->state.actions.end()) {
@@ -2025,7 +2198,7 @@ Status Engine::record_action_ack(const ActionAcknowledgment& ack) {
 }
 
 Status Engine::record_action_result(const ActionResult& result) {
-    std::vector<PendingWrite> pending;
+    Impl::Batch pending(*impl_);
     std::unique_lock<std::shared_mutex> lock(impl_->mutex);
     const auto it = impl_->state.actions.find(result.action);
     if (it == impl_->state.actions.end()) {
@@ -2101,7 +2274,7 @@ Status Engine::record_action_result(const ActionResult& result) {
 // --- Verification ----------------------------------------------------------------------
 
 Result<ContainmentVerification> Engine::verify_containment(ContainmentGeneration generation) {
-    std::vector<PendingWrite> pending;
+    Impl::Batch pending(*impl_);
     std::unique_lock<std::shared_mutex> lock(impl_->mutex);
     const auto it = impl_->state.containments.find(generation);
     if (it == impl_->state.containments.end()) {
@@ -2402,7 +2575,7 @@ Result<DegradedModeAssessment> Engine::authorize_degraded_mode(DegradedModeContr
                               to_string(resource));
         }
     }
-    std::vector<PendingWrite> pending;
+    Impl::Batch pending(*impl_);
     std::unique_lock<std::shared_mutex> lock(impl_->mutex);
     for (const ResourceId resource : contract.prohibited_resources) {
         if (impl_->state.topology.resources.find(resource) == impl_->state.topology.resources.end()) {
@@ -2501,7 +2674,7 @@ Result<DegradedModeAssessment> Engine::authorize_degraded_mode(DegradedModeContr
 }
 
 Result<DegradedModeAssessment> Engine::revalidate_degraded_mode(DegradedModeId id) {
-    std::vector<PendingWrite> pending;
+    Impl::Batch pending(*impl_);
     std::unique_lock<std::shared_mutex> lock(impl_->mutex);
     const auto contract_it = impl_->state.degraded_contracts.find(id);
     if (contract_it == impl_->state.degraded_contracts.end()) {
@@ -2642,6 +2815,16 @@ namespace {
         return assessment;
     }
 
+    const bool epoch_current = !request.epoch.valid() || request.epoch == state.epoch;
+    criterion("request_epoch_current", epoch_current,
+              "request issued under " + to_string(request.epoch) + ", current " +
+                  to_string(state.epoch));
+    if (!epoch_current) {
+        assessment.decision = ReleaseDecision::RELEASE_DENIED_AUTHORITY;
+        assessment.summary = "the request was issued under a superseded coordinator epoch";
+        return assessment;
+    }
+
     if (request.requester_boot.valid()) {
         const auto incarnation =
             state.workers.incarnations.find(WorkerKey{request.requester_worker, request.requester_boot});
@@ -2756,7 +2939,7 @@ Result<ReleaseAssessment> Engine::request_release(const ReleaseRequest& request)
 }
 
 Result<ReleaseAssessment> Engine::authorize_release(const ReleaseRequest& request) {
-    std::vector<PendingWrite> pending;
+    Impl::Batch pending(*impl_);
     std::unique_lock<std::shared_mutex> lock(impl_->mutex);
     ReleaseAssessment assessment = assess_release(impl_->state, request, impl_->now());
     const ReleaseGeneration release_generation = next_generation(impl_->state.release_generation);
@@ -3001,7 +3184,7 @@ Result<ContainmentRecord> Engine::worker_authority_lost(WorkerId worker, WorkerB
     ResourceId subject;
     ResourceGeneration subject_generation;
     {
-        std::vector<PendingWrite> pending;
+        Impl::Batch pending(*impl_);
         std::unique_lock<std::shared_mutex> lock(impl_->mutex);
         const auto it = impl_->state.workers.incarnations.find(key);
         if (it == impl_->state.workers.incarnations.end()) {
@@ -3041,8 +3224,10 @@ Result<ContainmentRecord> Engine::worker_authority_lost(WorkerId worker, WorkerB
                          detail::write_worker(writer, frozen_worker);
                      });
 
+        // An incarnation is the worker identity and the boot identity together:
+        // another worker that happens to use the same boot number is unaffected.
         for (const auto& entry : impl_->state.topology.resources) {
-            if (entry.second.owner_boot != boot) {
+            if (entry.second.owner_worker != worker || entry.second.owner_boot != boot) {
                 continue;
             }
             if (!subject.valid() || entry.second.resource_class == ResourceClass::WORKER) {
@@ -3061,7 +3246,7 @@ Result<ContainmentRecord> Engine::worker_authority_lost(WorkerId worker, WorkerB
         const std::uint64_t now_ms = impl_->now();
         std::vector<ResourceId> bound;
         for (const auto& entry : impl_->state.topology.resources) {
-            if (entry.second.owner_boot == boot) {
+            if (entry.second.owner_worker == worker && entry.second.owner_boot == boot) {
                 bound.push_back(entry.first);
             }
         }
@@ -3151,7 +3336,7 @@ Result<CoordinatorEpoch> Engine::recover_from_store(DurableStore& store, std::ui
     bool corrupted = false;
     std::string corruption_detail;
     {
-        std::vector<PendingWrite> pending;
+        Impl::Batch pending(*impl_);
         std::unique_lock<std::shared_mutex> lock(impl_->mutex);
         impl_->store = &store;
         impl_->state = RuntimeSnapshot{};
@@ -3186,12 +3371,33 @@ Result<CoordinatorEpoch> Engine::recover_from_store(DurableStore& store, std::ui
                     if (!detail::read_resource(reader, record)) {
                         return false;
                     }
-                    impl_->state.topology.resources[record.id] = record;
+                    Topology& topology = impl_->state.topology;
+                    const auto existing = topology.resources.find(record.id);
+                    const ResourceRecord previous =
+                        existing != topology.resources.end() ? existing->second : ResourceRecord{};
+                    rejoin_domain(topology.containment_domains, previous.containment_domain,
+                                  record.containment_domain, record.id);
+                    rejoin_domain(topology.isolation_domains, previous.isolation_domain,
+                                  record.isolation_domain, record.id);
+                    rejoin_domain(topology.failure_domains, previous.failure_domain,
+                                  record.failure_domain, record.id);
+                    topology.resources[record.id] = record;
                     break;
                 }
                 case detail::DurableEventKind::RESOURCE_REMOVE: {
                     const ResourceId id = detail::rd_id<ResourceId>(reader);
-                    impl_->state.topology.resources.erase(id);
+                    Topology& topology = impl_->state.topology;
+                    const auto existing = topology.resources.find(id);
+                    if (existing != topology.resources.end()) {
+                        const ResourceRecord removed = existing->second;
+                        rejoin_domain(topology.containment_domains, removed.containment_domain,
+                                      ContainmentDomainId{}, id);
+                        rejoin_domain(topology.isolation_domains, removed.isolation_domain,
+                                      IsolationDomainId{}, id);
+                        rejoin_domain(topology.failure_domains, removed.failure_domain,
+                                      FailureDomainId{}, id);
+                        topology.resources.erase(existing);
+                    }
                     break;
                 }
                 case detail::DurableEventKind::CONTAINMENT_DOMAIN_UPSERT: {
@@ -3199,12 +3405,16 @@ Result<CoordinatorEpoch> Engine::recover_from_store(DurableStore& store, std::ui
                     if (!detail::read_containment_domain(reader, domain)) {
                         return false;
                     }
-                    impl_->state.topology.containment_domains[domain.id] = domain;
+                    replay_domain_upsert(impl_->state.topology,
+                                         impl_->state.topology.containment_domains, domain,
+                                         &ResourceRecord::containment_domain);
                     break;
                 }
                 case detail::DurableEventKind::CONTAINMENT_DOMAIN_REMOVE: {
-                    impl_->state.topology.containment_domains.erase(
-                        detail::rd_id<ContainmentDomainId>(reader));
+                    replay_domain_remove(impl_->state.topology,
+                                         impl_->state.topology.containment_domains,
+                                         detail::rd_id<ContainmentDomainId>(reader),
+                                         &ResourceRecord::containment_domain);
                     break;
                 }
                 case detail::DurableEventKind::ISOLATION_DOMAIN_UPSERT: {
@@ -3212,12 +3422,16 @@ Result<CoordinatorEpoch> Engine::recover_from_store(DurableStore& store, std::ui
                     if (!detail::read_isolation_domain(reader, domain)) {
                         return false;
                     }
-                    impl_->state.topology.isolation_domains[domain.id] = domain;
+                    replay_domain_upsert(impl_->state.topology,
+                                         impl_->state.topology.isolation_domains, domain,
+                                         &ResourceRecord::isolation_domain);
                     break;
                 }
                 case detail::DurableEventKind::ISOLATION_DOMAIN_REMOVE: {
-                    impl_->state.topology.isolation_domains.erase(
-                        detail::rd_id<IsolationDomainId>(reader));
+                    replay_domain_remove(impl_->state.topology,
+                                         impl_->state.topology.isolation_domains,
+                                         detail::rd_id<IsolationDomainId>(reader),
+                                         &ResourceRecord::isolation_domain);
                     break;
                 }
                 case detail::DurableEventKind::FAILURE_DOMAIN_UPSERT: {
@@ -3225,12 +3439,16 @@ Result<CoordinatorEpoch> Engine::recover_from_store(DurableStore& store, std::ui
                     if (!detail::read_failure_domain(reader, domain)) {
                         return false;
                     }
-                    impl_->state.topology.failure_domains[domain.id] = domain;
+                    replay_domain_upsert(impl_->state.topology,
+                                         impl_->state.topology.failure_domains, domain,
+                                         &ResourceRecord::failure_domain);
                     break;
                 }
                 case detail::DurableEventKind::FAILURE_DOMAIN_REMOVE: {
-                    impl_->state.topology.failure_domains.erase(
-                        detail::rd_id<FailureDomainId>(reader));
+                    replay_domain_remove(impl_->state.topology,
+                                         impl_->state.topology.failure_domains,
+                                         detail::rd_id<FailureDomainId>(reader),
+                                         &ResourceRecord::failure_domain);
                     break;
                 }
                 case detail::DurableEventKind::DEPENDENCY_UPSERT: {
@@ -3399,6 +3617,12 @@ Result<CoordinatorEpoch> Engine::recover_from_store(DurableStore& store, std::ui
             }
             impl_->rebuild_digest_index();
             impl_->durable_sequence = last_sequence;
+            {
+                // The journal resumes after the last record that was replayed.
+                const std::lock_guard<std::mutex> turn(impl_->journal_mutex);
+                impl_->journal_appended = last_sequence;
+            }
+            impl_->journal_turn.notify_all();
             impl_->state.now_ms = now_ms;
             impl_->state.history.shrink_to_fit();
             if (recovery.torn_tail_bytes != 0) {

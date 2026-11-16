@@ -224,4 +224,114 @@ FCF_TEST(domain_model, policy_update_advances_the_policy_generation) {
     FCF_REQUIRE(engine.query_system_status().policy_generation > before);
 }
 
+FCF_TEST(domain_model, removing_a_domain_never_fabricates_a_resource) {
+    LogicalClock clock;
+    Engine engine(make_config(clock));
+    // Each boundary is declared with a member that never registers.
+    const Result<ContainmentDomain> containment =
+        engine.register_domain(make_domain(301, "cd", false, {7}));
+    const Result<IsolationDomain> isolation =
+        engine.register_isolation_domain(make_isolation_domain(101, "iso", {7}));
+    const Result<FailureDomain> failure =
+        engine.register_failure_domain(make_failure_domain(201, "fd", {7}));
+    FCF_REQUIRE(containment.ok() && isolation.ok() && failure.ok());
+
+    FCF_REQUIRE(engine.remove_domain(containment.value().id, containment.value().generation).ok());
+    FCF_REQUIRE(
+        engine.remove_isolation_domain(isolation.value().id, isolation.value().generation).ok());
+    FCF_REQUIRE(engine.remove_failure_domain(failure.value().id, failure.value().generation).ok());
+
+    FCF_EQ(engine.query_system_status().resource_count, 0U);
+    FCF_REQUIRE(!engine.query_resource_status(ResourceId::from_value(7)).ok());
+    FCF_REQUIRE(!engine.recovery_incomplete());
+}
+
+FCF_TEST(domain_model, rejected_domain_registration_changes_nothing) {
+    LogicalClock clock;
+    Engine engine(make_config(clock));
+    FCF_REQUIRE(engine.register_domain(make_domain(301, "first", false, {})).ok());
+    add_resource(engine, ResourceSpec{1, "free", ResourceClass::GENERIC, ProtectionClass::STANDARD, 0, 0,
+                                      0, 0, 0});
+    add_resource(engine, ResourceSpec{2, "taken", ResourceClass::GENERIC, ProtectionClass::STANDARD, 301,
+                                      0, 0, 0, 0});
+    const TopologyGeneration before = engine.query_system_status().topology_generation;
+
+    // Resource 2 already belongs to another boundary, so the registration is refused.
+    const Result<ContainmentDomain> rejected =
+        engine.register_domain(make_domain(302, "second", false, {1, 2}));
+    FCF_REQUIRE(!rejected.ok());
+    FCF_EQ(rejected.error().code(), ErrorCode::INVALID_DOMAIN_GRAPH);
+
+    // Nothing of the refused boundary may remain.
+    const Result<ResourceStatusView> free_resource =
+        engine.query_resource_status(ResourceId::from_value(1));
+    FCF_REQUIRE(free_resource.ok());
+    FCF_REQUIRE_MSG(!free_resource.value().resource.containment_domain.valid(),
+                    "a resource was left inside a boundary that was never registered");
+    FCF_EQ(engine.query_system_status().topology_generation, before);
+}
+
+FCF_TEST(domain_model, resource_update_cannot_reference_an_unknown_domain) {
+    LogicalClock clock;
+    Engine engine(make_config(clock));
+    build_two_isolation_domains(engine);
+    const Result<ResourceStatusView> current = engine.query_resource_status(ResourceId::from_value(1));
+    FCF_REQUIRE(current.ok());
+
+    ResourceRecord isolation = current.value().resource;
+    isolation.isolation_domain = IsolationDomainId::from_value(999);
+    const Result<ResourceRecord> bad_isolation = engine.update_resource(isolation, isolation.generation);
+    FCF_REQUIRE(!bad_isolation.ok());
+    FCF_EQ(bad_isolation.error().code(), ErrorCode::INVALID_DOMAIN_GRAPH);
+
+    ResourceRecord containment = current.value().resource;
+    containment.containment_domain = ContainmentDomainId::from_value(998);
+    FCF_REQUIRE(!engine.update_resource(containment, containment.generation).ok());
+
+    ResourceRecord failure = current.value().resource;
+    failure.failure_domain = FailureDomainId::from_value(997);
+    FCF_REQUIRE(!engine.update_resource(failure, failure.generation).ok());
+
+    // The refused updates left the resource as it was.
+    const Result<ResourceStatusView> after = engine.query_resource_status(ResourceId::from_value(1));
+    FCF_REQUIRE(after.ok());
+    FCF_EQ(after.value().resource.generation, current.value().resource.generation);
+    FCF_EQ(after.value().resource.isolation_domain, IsolationDomainId::from_value(101));
+}
+
+FCF_TEST(domain_model, losing_one_worker_does_not_fence_another_workers_resources) {
+    LogicalClock clock;
+    Engine engine(make_config(clock));
+    // Two workers happen to use the same boot number. An incarnation is the pair of
+    // worker identity and boot identity, never the boot number alone.
+    const WorkerBootId boot = WorkerBootId::from_value(7);
+    FCF_REQUIRE(engine
+                    .register_worker(WorkerId::from_value(1), boot, "a",
+                                     EvidenceSequence::from_value(1))
+                    .ok());
+    FCF_REQUIRE(engine
+                    .register_worker(WorkerId::from_value(2), boot, "b",
+                                     EvidenceSequence::from_value(1))
+                    .ok());
+    add_resource(engine, ResourceSpec{1, "worker-a", ResourceClass::WORKER, ProtectionClass::STANDARD, 0,
+                                      0, 0, 1, 7});
+    add_resource(engine, ResourceSpec{2, "worker-b", ResourceClass::WORKER, ProtectionClass::STANDARD, 0,
+                                      0, 0, 2, 7});
+
+    const Result<ContainmentRecord> lost = engine.worker_authority_lost(
+        WorkerId::from_value(1), boot, FaultKind::PROCESS_DEATH, "connection closed", 10);
+    FCF_REQUIRE_MSG(lost.ok(), lost.ok() ? "" : lost.error().to_string());
+    FCF_REQUIRE(contains(lost.value().mandatory, 1));
+    FCF_REQUIRE_MSG(!contains(lost.value().mandatory, 2),
+                    "the surviving worker's resource was placed inside the blast radius");
+
+    const Result<ResourceStatusView> survivor = engine.query_resource_status(ResourceId::from_value(2));
+    FCF_REQUIRE(survivor.ok());
+    FCF_REQUIRE_MSG(!survivor.value().quarantined, "the surviving worker's resource was fenced");
+    FCF_REQUIRE(survivor.value().operable);
+    const Result<WorkerRecord> other = engine.query_worker(WorkerId::from_value(2), boot);
+    FCF_REQUIRE(other.ok());
+    FCF_REQUIRE(holds_live_authority(other.value().state));
+}
+
 int main(int argc, char** argv) { return fcf::test::run(argc, argv); }

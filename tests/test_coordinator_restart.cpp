@@ -148,7 +148,7 @@ FCF_TEST(coordinator_restart, crash_and_recover_preserves_containment_without_re
     FCF_REQUIRE(containment.value().lines.front().find("mandatory=2") != std::string::npos);
 
     // Crash: terminate the coordinator process with no graceful shutdown at all.
-    (void)0;
+    FCF_REQUIRE(first.value().kill());
     control.close();
 
     // --- Second coordinator over the same durable directory. ------------------------
@@ -251,6 +251,77 @@ FCF_TEST(coordinator_restart, crash_and_recover_preserves_containment_without_re
     const int exit_code = second.value().wait();
     FCF_EQ(exit_code, 0);
     (void)worker.value().kill();
+    recovered.close();
+    shutdown_network();
+}
+
+FCF_TEST(coordinator_restart, orderly_shutdown_is_not_recorded_as_worker_death) {
+    FCF_REQUIRE(initialise_network().ok());
+    ScratchState scratch;
+
+    Result<ChildProcess> first = ChildProcess::spawn(
+        kCoordinator, {"--port", "0", "--no-stdin", "--state-dir", scratch.text()});
+    FCF_REQUIRE_MSG(first.ok(), first.ok() ? "" : first.error().to_string());
+    const std::string first_listening = first.value().wait_for("LISTENING ");
+    FCF_REQUIRE(!first_listening.empty());
+    const std::uint16_t first_port = parse_port(first_listening);
+
+    Result<ControlClient> first_client = ControlClient::connect("127.0.0.1", first_port);
+    FCF_REQUIRE(first_client.ok());
+    ControlClient control = std::move(first_client.value());
+    require_ok(control.send("register-isolation-domain", {"101", "iso-A", "LOGICAL_CONTAINMENT", "1,2"}),
+               "register isolation domain");
+    require_ok(control.send("register-resource",
+                            {"1", "worker-A", "WORKER", "STANDARD", "-", "101", "-", "-", "-"}),
+               "register worker resource");
+    require_ok(control.send("register-resource",
+                            {"2", "exec-A", "EXECUTION", "STANDARD", "-", "101", "-", "-", "-"}),
+               "register execution resource");
+
+    const std::string endpoint = std::string("127.0.0.1:") + std::to_string(first_port);
+    Result<ChildProcess> worker = ChildProcess::spawn(
+        kWorker, {"--connect", endpoint, "--id", "1", "--boot", "6001", "--resources", "1,2"});
+    FCF_REQUIRE(worker.ok());
+    FCF_REQUIRE(!worker.value().wait_for("WORKER READY").empty());
+    require_ok(control.send("poll-workers"), "poll workers");
+    const Result<ControlResponse> owned =
+        poll_until(control, "resource", {"1"}, [](const ControlResponse& response) {
+            return has_line(response, "state=ACTIVE") && has_line(response, "owner_boot=WorkerBootId:6001");
+        });
+    FCF_REQUIRE_MSG(owned.ok(), owned.ok() ? "" : owned.error().to_string());
+
+    // The coordinator stops in an orderly way while the worker is still connected.
+    // The request is answered before the coordinator starts closing connections.
+    require_ok(control.send("shutdown"), "shutdown");
+    FCF_EQ(first.value().wait(), 0);
+    control.close();
+    (void)worker.value().kill();
+
+    Result<ChildProcess> second = ChildProcess::spawn(
+        kCoordinator, {"--port", "0", "--no-stdin", "--state-dir", scratch.text()});
+    FCF_REQUIRE_MSG(second.ok(), second.ok() ? "" : second.error().to_string());
+    const std::string second_listening = second.value().wait_for("LISTENING ");
+    FCF_REQUIRE_MSG(!second_listening.empty(),
+                    "the restarted coordinator produced no listening line: " +
+                        join(second.value().drain()));
+    Result<ControlClient> second_client =
+        ControlClient::connect("127.0.0.1", parse_port(second_listening));
+    FCF_REQUIRE(second_client.ok());
+    ControlClient recovered = std::move(second_client.value());
+
+    // Closing a connection as part of the coordinator's own shutdown is not an
+    // observation that the worker died: nothing was fenced and nothing contained.
+    const Result<ControlResponse> resource = recovered.send("resource", {"1"});
+    FCF_REQUIRE(resource.ok() && resource.value().ok);
+    FCF_REQUIRE_MSG(has_line(resource.value(), "quarantined=0"),
+                    "an orderly coordinator shutdown fenced a connected worker's resource");
+    const Result<ControlResponse> containments = recovered.send("containments");
+    FCF_REQUIRE(containments.ok() && containments.value().ok);
+    FCF_REQUIRE_MSG(containments.value().lines.empty(),
+                    "an orderly coordinator shutdown committed a containment");
+
+    require_ok(recovered.send("shutdown"), "shutdown");
+    FCF_EQ(second.value().wait(), 0);
     recovered.close();
     shutdown_network();
 }

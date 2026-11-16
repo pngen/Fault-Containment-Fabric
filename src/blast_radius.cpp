@@ -161,9 +161,13 @@ Result<BlastRadius> compute_blast_radius(const BlastRadiusInput& input) {
         fault.evidence.kind == FaultKind::WORKER_AUTHORITY_LOST ||
         fault.evidence.kind == FaultKind::STALE_AUTHORITY) {
         if (subject.owner_boot.valid()) {
+            // An incarnation is the worker identity and the boot identity together:
+            // another worker that happens to use the same boot number holds its own,
+            // independent authority.
             for (const auto& entry : topology.resources) {
                 const ResourceRecord& candidate = entry.second;
-                if (candidate.owner_boot == subject.owner_boot) {
+                if (candidate.owner_boot == subject.owner_boot &&
+                    candidate.owner_worker == subject.owner_worker) {
                     acc.include(candidate.id, candidate.generation, InclusionReason::SHARED_AUTHORITY,
                                 "live authority bound to " + to_string(candidate.owner_boot));
                 }

@@ -740,15 +740,29 @@ struct Coordinator::Impl {
     std::mutex connection_mutex;
     std::condition_variable connection_drained;
     std::size_t active_connections = 0;
-    std::vector<Socket*> live_sockets;
-    std::map<WorkerBootId, Socket*> peer_sockets;
+    /// Every connection being served. The entries share ownership with the thread
+    /// that serves the connection, so a socket reached from another thread cannot
+    /// be destroyed underneath it.
+    std::vector<std::shared_ptr<Socket>> live_sockets;
+    /// Live peers by incarnation: the worker identity and the boot identity together.
+    std::map<WorkerKey, std::shared_ptr<Socket>> peer_sockets;
 
     std::mutex shutdown_mutex;
     std::condition_variable shutdown_cv;
     bool shutdown_requested = false;
 
     /// Control commands that need coordinator-level state rather than engine state.
+    /// A shutdown request is only answered here; the caller signals it once the
+    /// answer has been delivered.
     Result<ControlResponse> execute(const ControlRequest& request);
+
+    void signal_shutdown() {
+        {
+            std::lock_guard<std::mutex> guard(shutdown_mutex);
+            shutdown_requested = true;
+        }
+        shutdown_cv.notify_all();
+    }
 
     class SocketExecutor : public Executor {
     public:
@@ -761,10 +775,11 @@ struct Coordinator::Impl {
                 // to perform hardware isolation.
                 return std::string("coordinator:logical:") + to_string(action.id);
             }
-            Socket* peer = nullptr;
+            std::shared_ptr<Socket> peer;
             {
                 std::lock_guard<std::mutex> guard(owner_.connection_mutex);
-                const auto it = owner_.peer_sockets.find(action.envelope.worker_boot);
+                const auto it = owner_.peer_sockets.find(
+                    WorkerKey{action.envelope.worker, action.envelope.worker_boot});
                 if (it != owner_.peer_sockets.end()) {
                     peer = it->second;
                 }
@@ -779,6 +794,7 @@ struct Coordinator::Impl {
                 const auto resource = snapshot->topology.resources.find(target);
                 const bool same_incarnation =
                     resource != snapshot->topology.resources.end() &&
+                    resource->second.owner_worker == action.envelope.worker &&
                     resource->second.owner_boot == action.envelope.worker_boot;
                 const auto incarnation = snapshot->workers.incarnations.find(
                     WorkerKey{action.envelope.worker, action.envelope.worker_boot});
@@ -860,17 +876,18 @@ struct Coordinator::Impl {
         }
     }
 
-    /// Serves one connection. The socket object lives in a shared_ptr owned by the
-    /// connection thread and registered in live_sockets, so shutdown can close the
-    /// exact socket the thread is blocked on.
-    void serve(Socket& socket);
+    /// Serves one connection. The socket is shared between the connection thread
+    /// and the registries, so shutdown can interrupt the exact socket the thread is
+    /// blocked on. Only the connection thread ever closes it.
+    void serve(const std::shared_ptr<Socket>& connection);
 
-    void handle_frame(Socket& socket, const Frame& frame, WorkerId& worker, WorkerBootId& boot,
-                      bool& hello_done);
+    void handle_frame(const std::shared_ptr<Socket>& connection, const Frame& frame, WorkerId& worker,
+                      WorkerBootId& boot, bool& hello_done);
 };
 
-void Coordinator::Impl::handle_frame(Socket& socket, const Frame& frame, WorkerId& worker,
-                                     WorkerBootId& boot, bool& hello_done) {
+void Coordinator::Impl::handle_frame(const std::shared_ptr<Socket>& connection, const Frame& frame,
+                                     WorkerId& worker, WorkerBootId& boot, bool& hello_done) {
+    Socket& socket = *connection;
     auto reject = [&socket](ErrorCode code, const std::string& detail) {
         const Result<std::vector<std::byte>> payload = encode_reject(RejectMessage{code, detail});
         if (payload.ok()) {
@@ -901,7 +918,7 @@ void Coordinator::Impl::handle_frame(Socket& socket, const Frame& frame, WorkerI
                 boot = hello.value().boot;
                 hello_done = true;
                 const std::lock_guard<std::mutex> guard(connection_mutex);
-                peer_sockets[boot] = &socket;
+                peer_sockets[WorkerKey{worker, boot}] = connection;
             }
             const Result<std::vector<std::byte>> payload = encode_hello_ack(ack);
             if (!payload.ok()) {
@@ -918,7 +935,7 @@ void Coordinator::Impl::handle_frame(Socket& socket, const Frame& frame, WorkerI
                 return;
             }
             WorkerEvidenceAck ack;
-            if (!hello_done || evidence.value().boot != boot) {
+            if (!hello_done || evidence.value().worker != worker || evidence.value().boot != boot) {
                 ack.granted = false;
                 ack.detail = "evidence for an incarnation that did not complete the handshake";
                 reject(ErrorCode::STALE_WORKER_BOOT, ack.detail);
@@ -1004,7 +1021,7 @@ void Coordinator::Impl::handle_frame(Socket& socket, const Frame& frame, WorkerI
                 reject(report.error().code(), report.error().to_string());
                 return;
             }
-            if (!hello_done || report.value().boot != boot) {
+            if (!hello_done || report.value().worker != worker || report.value().boot != boot) {
                 reject(ErrorCode::STALE_WORKER_BOOT, "fault report from an unhandshaken incarnation");
                 return;
             }
@@ -1076,6 +1093,11 @@ void Coordinator::Impl::handle_frame(Socket& socket, const Frame& frame, WorkerI
                 return;
             }
             (void)socket.send_frame(MessageKind::CONTROL_RESPONSE, payload.value());
+            if (decoded.value().command == "shutdown") {
+                // Only now: a coordinator that starts closing connections before
+                // its reply is on the wire cuts off its own answer.
+                signal_shutdown();
+            }
             return;
         }
         case MessageKind::HELLO_ACK:
@@ -1094,7 +1116,8 @@ void Coordinator::Impl::handle_frame(Socket& socket, const Frame& frame, WorkerI
     reject(ErrorCode::FRAME_CORRUPT, "unknown mandatory message type");
 }
 
-void Coordinator::Impl::serve(Socket& socket) {
+void Coordinator::Impl::serve(const std::shared_ptr<Socket>& connection) {
+    Socket& socket = *connection;
     WorkerId worker;
     WorkerBootId boot;
     bool hello_done = false;
@@ -1103,31 +1126,42 @@ void Coordinator::Impl::serve(Socket& socket) {
         if (!frame.ok()) {
             break;
         }
-        handle_frame(socket, frame.value(), worker, boot, hello_done);
+        handle_frame(connection, frame.value(), worker, boot, hello_done);
     }
 
     {
         std::lock_guard<std::mutex> guard(connection_mutex);
         if (hello_done) {
-            peer_sockets.erase(boot);
+            const auto peer = peer_sockets.find(WorkerKey{worker, boot});
+            if (peer != peer_sockets.end() && peer->second == connection) {
+                peer_sockets.erase(peer);
+            }
         }
-        const auto it = std::find(live_sockets.begin(), live_sockets.end(), &socket);
+        const auto it = std::find(live_sockets.begin(), live_sockets.end(), connection);
         if (it != live_sockets.end()) {
             live_sockets.erase(it);
         }
-        --active_connections;
     }
-    connection_drained.notify_all();
 
-    if (hello_done) {
-        // A closed connection without a graceful retirement is an observed
-        // authority loss for that exact incarnation.
+    // A closed connection without a graceful retirement is an observed authority
+    // loss for that exact incarnation. A connection the coordinator closed itself
+    // while stopping is not: that is the coordinator's own shutdown, and every
+    // worker would otherwise be recorded as dead by an orderly stop.
+    if (hello_done && !stopped.load()) {
         const Result<ContainmentRecord> containment = engine->worker_authority_lost(
             worker, boot, FaultKind::PROCESS_DEATH,
             "worker connection closed without graceful retirement", 0);
         if (containment.ok()) {
             dispatch_and_settle(containment.value().generation);
         }
+    }
+
+    // Reported as drained only now, and as the last thing this thread does with
+    // the coordinator: stop() waits for it before it shuts the engine down.
+    {
+        std::lock_guard<std::mutex> guard(connection_mutex);
+        --active_connections;
+        connection_drained.notify_all();
     }
 }
 
@@ -1166,9 +1200,8 @@ Result<std::unique_ptr<Coordinator>> Coordinator::start(Config config) {
             if (!accepted.ok()) {
                 return;
             }
-            // The socket is owned by the connection thread through this shared_ptr,
-            // and the registry points at that same live object so shutdown can close
-            // exactly the socket the thread is blocked on.
+            // The socket is shared by the connection thread and the registry, so
+            // shutdown can interrupt exactly the socket the thread is blocked on.
             std::shared_ptr<Socket> socket = std::make_shared<Socket>(std::move(accepted.value()));
             {
                 std::lock_guard<std::mutex> guard(impl.connection_mutex);
@@ -1178,9 +1211,9 @@ Result<std::unique_ptr<Coordinator>> Coordinator::start(Config config) {
                     continue;
                 }
                 ++impl.active_connections;
-                impl.live_sockets.push_back(socket.get());
+                impl.live_sockets.push_back(socket);
             }
-            std::thread([&impl, socket]() { impl.serve(*socket); }).detach();
+            std::thread([&impl, socket]() { impl.serve(socket); }).detach();
         }
     });
     return coordinator;
@@ -1199,8 +1232,12 @@ void Coordinator::stop() {
     impl.listener.close();
     {
         std::lock_guard<std::mutex> guard(impl.connection_mutex);
-        for (Socket* socket : impl.live_sockets) {
-            socket->close();
+        // Interrupted, not closed: closing a socket under the receive its own
+        // thread is blocked in resets the connection, and the peer then loses
+        // whatever it has not read yet, including the answer to the request that
+        // asked for this shutdown. Each connection thread closes its own socket.
+        for (const std::shared_ptr<Socket>& socket : impl.live_sockets) {
+            socket->interrupt();
         }
     }
     impl.connection_drained.notify_all();
@@ -1221,17 +1258,12 @@ Result<ControlResponse> Coordinator::Impl::execute(const ControlRequest& request
         ControlResponse response;
         response.ok = true;
         response.add("shutdown=accepted");
-        {
-            std::lock_guard<std::mutex> guard(shutdown_mutex);
-            shutdown_requested = true;
-        }
-        shutdown_cv.notify_all();
         return response;
     }
     if (request.command == "poll-workers") {
         // Deterministic evidence pull: the coordinator asks every live peer for
         // fresh evidence instead of relying on timers.
-        std::vector<Socket*> peers;
+        std::vector<std::shared_ptr<Socket>> peers;
         {
             std::lock_guard<std::mutex> guard(connection_mutex);
             for (const auto& entry : peer_sockets) {
@@ -1241,7 +1273,7 @@ Result<ControlResponse> Coordinator::Impl::execute(const ControlRequest& request
         ControlResponse response;
         response.ok = true;
         std::size_t sent = 0;
-        for (Socket* peer : peers) {
+        for (const std::shared_ptr<Socket>& peer : peers) {
             const Status status = peer->send_frame(MessageKind::QUERY_REQUEST, {});
             if (status.ok()) {
                 ++sent;
@@ -1254,7 +1286,11 @@ Result<ControlResponse> Coordinator::Impl::execute(const ControlRequest& request
 }
 
 Result<ControlResponse> Coordinator::execute_control(const ControlRequest& request) {
-    return impl_->execute(request);
+    Result<ControlResponse> response = impl_->execute(request);
+    if (request.command == "shutdown") {
+        impl_->signal_shutdown();
+    }
+    return response;
 }
 
 void Coordinator::request_shutdown() {
