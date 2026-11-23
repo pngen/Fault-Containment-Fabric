@@ -180,6 +180,12 @@ if(FAULT_CONTAINMENT_ENABLE_CUDA)
     if(CMAKE_CUDA_COMPILER)
         enable_language(CUDA)
         add_library(fcf_cuda_probe STATIC cuda/cuda_probe.cu)
+        # The CUDA runtime CMake links by default is built against the static C runtime.
+        # Without this, every program linked with the CUDA code gets LNK4098 (LIBCMT
+        # conflicts with the DLL runtime the project uses).
+        if(MSVC)
+            target_link_options(fcf_cuda_probe PUBLIC /NODEFAULTLIB:LIBCMT)
+        endif()
         target_include_directories(fcf_cuda_probe PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
         set_target_properties(fcf_cuda_probe PROPERTIES
             CUDA_STANDARD 17
